@@ -1,0 +1,46 @@
+name: Build and deploy to Beget
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: vpe03-production
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Build and smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --build-arg REVISION="$GITHUB_SHA" -t "vpe03-demo:$GITHUB_SHA" .
+          docker run -d --name smoke --read-only --cap-drop ALL --security-opt no-new-privileges -p 127.0.0.1:18083:8080 "vpe03-demo:$GITHUB_SHA"
+          trap 'docker rm -f smoke' EXIT
+          for attempt in {1..20}; do
+            if curl -fsS http://127.0.0.1:18083/health > /tmp/health.json; then break; fi
+            sleep 1
+          done
+          python3 -c 'import json,os; d=json.load(open("/tmp/health.json")); assert d["commit"] == os.environ["GITHUB_SHA"]; assert d["status"] == "ok"'
+          curl -fsS http://127.0.0.1:18083/ | grep -q 'VPe03'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18083/missing)" = 404
+      - name: Deploy over restricted SSH
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          KNOWN_HOSTS: ${{ secrets.KNOWN_HOSTS }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/deploy_key ~/.ssh/known_hosts
+          trap 'rm -f ~/.ssh/deploy_key' EXIT
+          docker save "vpe03-demo:$GITHUB_SHA" | gzip | ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o ConnectTimeout=15 -i ~/.ssh/deploy_key "root@$VPS_HOST" "$GITHUB_SHA"
+          curl -fsS --retry 5 --retry-delay 2 "http://$VPS_HOST:18083/health" > /tmp/live.json
+          python3 -c 'import json,os; assert json.load(open("/tmp/live.json"))["commit"] == os.environ["GITHUB_SHA"]'
